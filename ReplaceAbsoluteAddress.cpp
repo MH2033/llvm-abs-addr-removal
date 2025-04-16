@@ -58,7 +58,8 @@ class ReplacementCollector : public MatchFinder::MatchCallback {
     SourceManager &SM = *Result.SourceManager;
     LangOptions LangOpts = Result.Context->getLangOpts();
 
-    // Use expansion locations so that we modify the usage in the main file.
+    // Use expansion locations so that we modify the location where the macro is
+    // used.
     SourceLocation Begin = SM.getExpansionLoc(CastExpr->getBeginLoc());
     SourceLocation EndToken = SM.getExpansionLoc(CastExpr->getEndLoc());
     llvm::errs() << "[ReplacementCollector] Expansion Begin: "
@@ -180,8 +181,8 @@ class ReplacementASTConsumer : public ASTConsumer {
 // ReplacementFrontendAction
 //===----------------------------------------------------------------------===//
 
-// To fix our earlier segfault (consumer pointer null issue), we store a raw
-// pointer.
+// Store a raw pointer to the ASTConsumer (to avoid the consumer pointer
+// becoming null) so we can retrieve global declarations in EndSourceFileAction.
 class ReplacementFrontendAction : public ASTFrontendAction {
  public:
   ReplacementFrontendAction() : ConsumerPtr(nullptr) {}
@@ -197,6 +198,29 @@ class ReplacementFrontendAction : public ASTFrontendAction {
     StringRef OriginalText = SM.getBufferData(MainFID);
     llvm::errs() << "[FrontendAction] Original text length: "
                  << OriginalText.size() << "\n";
+
+    // Compute the insertion point: find the last occurrence of "#include" and
+    // then the newline after it.
+    size_t insertionOffset = 0;
+    size_t lastIncludePos = OriginalText.rfind("#include");
+    if (lastIncludePos != StringRef::npos) {
+      // find the newline after this include
+      size_t newlinePos = OriginalText.find('\n', lastIncludePos);
+      if (newlinePos != StringRef::npos) {
+        insertionOffset = newlinePos + 1;
+        llvm::errs() << "[FrontendAction] Inserting global declarations after "
+                        "last include at offset "
+                     << insertionOffset << ".\n";
+      } else {
+        llvm::errs() << "[FrontendAction] Newline not found after last "
+                        "#include. Inserting at end of file.\n";
+        insertionOffset = OriginalText.size();
+      }
+    } else {
+      llvm::errs() << "[FrontendAction] No #include found. Inserting at "
+                      "beginning of file.\n";
+      insertionOffset = 0;
+    }
 
     // Retrieve collected global declarations from our stored consumer pointer.
     std::vector<std::string> GlobalDecls;
@@ -215,10 +239,16 @@ class ReplacementFrontendAction : public ASTFrontendAction {
       llvm::errs() << "[FrontendAction] Global declaration: " << decl;
     }
 
-    // Create a Replacement to insert the global declarations at the start of
-    // the main file.
-    Replacement GlobalInsert(SM, SM.getLocForStartOfFile(MainFID), 0,
-                             GlobalText);
+    // Compute the insertion SourceLocation.
+    SourceLocation FileStart = SM.getLocForStartOfFile(MainFID);
+    SourceLocation insertionLoc = FileStart.getLocWithOffset(insertionOffset);
+    llvm::errs() << "[FrontendAction] Insertion location computed at offset "
+                 << insertionOffset << ": " << insertionLoc.printToString(SM)
+                 << "\n";
+
+    // Create a Replacement to insert the global declarations after the
+    // includes.
+    Replacement GlobalInsert(SM, insertionLoc, 0, GlobalText);
     if (llvm::Error Err = Reps.add(GlobalInsert))
       llvm::errs() << "[FrontendAction] Error adding global decl replacement: "
                    << llvm::toString(std::move(Err)) << "\n";
