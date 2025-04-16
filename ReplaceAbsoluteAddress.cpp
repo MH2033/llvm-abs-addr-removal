@@ -17,12 +17,14 @@
 #include "clang/Tooling/Refactoring.h"
 #include "clang/Tooling/Tooling.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace clang;
 using namespace clang::ast_matchers;
 using namespace clang::tooling;
 
+#define DEBUG_TYPE "abs-addr-replace"
 //===----------------------------------------------------------------------===//
 // Command-line Options
 //===----------------------------------------------------------------------===//
@@ -30,7 +32,6 @@ using namespace clang::tooling;
 static llvm::cl::OptionCategory MyToolCategory(
     "replace-absolute-address options");
 
-// The -o option: if specified, output will be saved to that filename.
 static llvm::cl::opt<std::string> OutputFilename(
     "o", llvm::cl::desc("Specify output filename"),
     llvm::cl::value_desc("filename"), llvm::cl::init(""));
@@ -39,7 +40,6 @@ static llvm::cl::opt<std::string> OutputFilename(
 // ReplacementCollector
 //===----------------------------------------------------------------------===//
 
-// This callback collects Replacements for every matched cast expression.
 class ReplacementCollector : public MatchFinder::MatchCallback {
  public:
   ReplacementCollector(Replacements &Reps,
@@ -48,56 +48,54 @@ class ReplacementCollector : public MatchFinder::MatchCallback {
       : Reps(Reps), GlobalMap(GlobalMap), GlobalDecls(GlobalDecls) {}
 
   virtual void run(const MatchFinder::MatchResult &Result) override {
-    llvm::errs() << "[ReplacementCollector] run() called\n";
+    LLVM_DEBUG(llvm::dbgs() << "[ReplacementCollector] run() called\n");
     const auto *CastExpr = Result.Nodes.getNodeAs<CStyleCastExpr>("absAddr");
     if (!CastExpr) {
-      llvm::errs() << "[ReplacementCollector] No cast expression found.\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[ReplacementCollector] No cast expression found.\n");
       return;
     }
 
     SourceManager &SM = *Result.SourceManager;
     LangOptions LangOpts = Result.Context->getLangOpts();
 
-    // Use expansion locations so that we modify the location where the macro is
-    // used.
     SourceLocation Begin = SM.getExpansionLoc(CastExpr->getBeginLoc());
     SourceLocation EndToken = SM.getExpansionLoc(CastExpr->getEndLoc());
-    llvm::errs() << "[ReplacementCollector] Expansion Begin: "
-                 << Begin.printToString(SM)
-                 << ", Expansion EndToken: " << EndToken.printToString(SM)
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[ReplacementCollector] Expansion Begin: "
+               << Begin.printToString(SM) << ", Expansion EndToken: "
+               << EndToken.printToString(SM) << "\n");
     SourceLocation End = Lexer::getLocForEndOfToken(EndToken, 0, SM, LangOpts);
     if (Begin.isInvalid() || End.isInvalid()) {
-      llvm::errs() << "[ReplacementCollector] Invalid Begin or End location.\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[ReplacementCollector] Invalid Begin or End location.\n");
       return;
     }
     CharSourceRange CharRange = CharSourceRange::getCharRange(Begin, End);
-    llvm::errs() << "[ReplacementCollector] Computed expansion range: "
-                 << Begin.printToString(SM) << " to " << End.printToString(SM)
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[ReplacementCollector] Computed expansion range: "
+               << Begin.printToString(SM) << " to " << End.printToString(SM)
+               << "\n");
 
-    // Log the original text.
     StringRef OrigText = Lexer::getSourceText(CharRange, SM, LangOpts);
-    llvm::errs() << "[ReplacementCollector] Original cast text: '" << OrigText
-                 << "'\n";
+    LLVM_DEBUG(llvm::dbgs() << "[ReplacementCollector] Original cast text: '"
+                            << OrigText << "'\n");
 
-    // Process the subexpression: if it's an IntegerLiteral, extract its value.
     const Expr *SubExpr = CastExpr->getSubExprAsWritten();
     if (const auto *IntLit =
             dyn_cast<IntegerLiteral>(SubExpr->IgnoreParenImpCasts())) {
       uint64_t value = IntLit->getValue().getLimitedValue();
-      llvm::errs() << "[ReplacementCollector] IntegerLiteral value: " << value
-                   << "\n";
+      LLVM_DEBUG(llvm::dbgs() << "[ReplacementCollector] IntegerLiteral value: "
+                              << value << "\n");
       std::string globalName;
 
-      // Generate or retrieve a global variable name.
       if (GlobalMap.find(value) == GlobalMap.end()) {
         globalName = "glob_" + std::to_string(GlobalMap.size());
         GlobalMap[value] = globalName;
-        llvm::errs() << "[ReplacementCollector] Generated new global name: "
-                     << globalName << "\n";
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[ReplacementCollector] Generated new global name: "
+                   << globalName << "\n");
 
-        // Generate a global declaration based on the cast type.
         QualType castType = CastExpr->getType();
         if (castType->isPointerType()) {
           QualType pointeeType = castType->getPointeeType();
@@ -112,31 +110,34 @@ class ReplacementCollector : public MatchFinder::MatchCallback {
             Decl = typeStr + " " + globalName + ";\n";
           }
           GlobalDecls.push_back(Decl);
-          llvm::errs() << "[ReplacementCollector] Global declaration: " << Decl;
+          LLVM_DEBUG(llvm::dbgs()
+                     << "[ReplacementCollector] Global declaration: " << Decl);
         }
       } else {
         globalName = GlobalMap[value];
-        llvm::errs() << "[ReplacementCollector] Using existing global name: "
-                     << globalName << "\n";
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[ReplacementCollector] Using existing global name: "
+                   << globalName << "\n");
       }
 
-      // Create a Replacement that replaces the entire cast expression with the
-      // global variable name.
       Replacement Rep(SM, CharRange, globalName);
-      llvm::errs() << "[ReplacementCollector] Creating replacement for "
-                      "expansion range (offset "
-                   << Rep.getOffset() << ", length " << Rep.getLength()
-                   << ") with text: " << globalName << "\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[ReplacementCollector] Creating replacement for "
+                    "expansion range (offset "
+                 << Rep.getOffset() << ", length " << Rep.getLength()
+                 << ") with text: " << globalName << "\n");
       if (llvm::Error Err = Reps.add(Rep)) {
-        llvm::errs() << "[ReplacementCollector] Error adding replacement: "
-                     << llvm::toString(std::move(Err)) << "\n";
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[ReplacementCollector] Error adding replacement: "
+                   << llvm::toString(std::move(Err)) << "\n");
       } else {
-        llvm::errs()
-            << "[ReplacementCollector] Replacement added successfully.\n";
+        LLVM_DEBUG(
+            llvm::dbgs()
+            << "[ReplacementCollector] Replacement added successfully.\n");
       }
     } else {
-      llvm::errs()
-          << "[ReplacementCollector] Subexpression is not an IntegerLiteral.\n";
+      LLVM_DEBUG(llvm::dbgs() << "[ReplacementCollector] Subexpression is not "
+                                 "an IntegerLiteral.\n");
     }
   }
 
@@ -154,18 +155,20 @@ class ReplacementASTConsumer : public ASTConsumer {
  public:
   ReplacementASTConsumer(Replacements &Reps)
       : Collector(Reps, GlobalMap, GlobalDecls) {
-    llvm::errs() << "[ASTConsumer] Adding matcher for C-style cast with "
-                    "IntegerLiteral.\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[ASTConsumer] Adding matcher for C-style cast with "
+                  "IntegerLiteral.\n");
     Matcher.addMatcher(
         cStyleCastExpr(hasSourceExpression(integerLiteral())).bind("absAddr"),
         &Collector);
   }
 
   virtual void HandleTranslationUnit(ASTContext &Context) override {
-    llvm::errs() << "[ASTConsumer] Handling Translation Unit.\n";
+    LLVM_DEBUG(llvm::dbgs() << "[ASTConsumer] Handling Translation Unit.\n");
     Matcher.matchAST(Context);
-    llvm::errs() << "[ASTConsumer] Translation Unit handled. Collected "
-                 << GlobalDecls.size() << " global declarations.\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[ASTConsumer] Translation Unit handled. Collected "
+               << GlobalDecls.size() << " global declarations.\n");
   }
 
   std::vector<std::string> getGlobalDecls() const { return GlobalDecls; }
@@ -181,123 +184,126 @@ class ReplacementASTConsumer : public ASTConsumer {
 // ReplacementFrontendAction
 //===----------------------------------------------------------------------===//
 
-// Store a raw pointer to the ASTConsumer (to avoid the consumer pointer
-// becoming null) so we can retrieve global declarations in EndSourceFileAction.
 class ReplacementFrontendAction : public ASTFrontendAction {
  public:
   ReplacementFrontendAction() : ConsumerPtr(nullptr) {}
 
   void EndSourceFileAction() override {
-    llvm::errs() << "[FrontendAction] EndSourceFileAction called.\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[FrontendAction] EndSourceFileAction called.\n");
     SourceManager &SM = getCompilerInstance().getSourceManager();
     FileID MainFID = SM.getMainFileID();
-    llvm::errs() << "[FrontendAction] Main FileID: " << MainFID.getHashValue()
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "[FrontendAction] Main FileID: "
+                            << MainFID.getHashValue() << "\n");
 
-    // Get original text of the main file.
     StringRef OriginalText = SM.getBufferData(MainFID);
-    llvm::errs() << "[FrontendAction] Original text length: "
-                 << OriginalText.size() << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "[FrontendAction] Original text length: "
+                            << OriginalText.size() << "\n");
 
-    // Compute the insertion point: find the last occurrence of "#include" and
-    // then the newline after it.
     size_t insertionOffset = 0;
     size_t lastIncludePos = OriginalText.rfind("#include");
     if (lastIncludePos != StringRef::npos) {
-      // find the newline after this include
       size_t newlinePos = OriginalText.find('\n', lastIncludePos);
       if (newlinePos != StringRef::npos) {
         insertionOffset = newlinePos + 1;
-        llvm::errs() << "[FrontendAction] Inserting global declarations after "
-                        "last include at offset "
-                     << insertionOffset << ".\n";
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[FrontendAction] Inserting global declarations after "
+                      "last include at offset "
+                   << insertionOffset << ".\n");
       } else {
-        llvm::errs() << "[FrontendAction] Newline not found after last "
-                        "#include. Inserting at end of file.\n";
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[FrontendAction] Newline not found after last "
+                      "#include. Inserting at end of file.\n");
         insertionOffset = OriginalText.size();
       }
     } else {
-      llvm::errs() << "[FrontendAction] No #include found. Inserting at "
-                      "beginning of file.\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] No #include found. Inserting at "
+                    "beginning of file.\n");
       insertionOffset = 0;
     }
 
-    // Retrieve collected global declarations from our stored consumer pointer.
     std::vector<std::string> GlobalDecls;
     if (ConsumerPtr) {
       GlobalDecls = ConsumerPtr->getGlobalDecls();
-      llvm::errs() << "[FrontendAction] Retrieved " << GlobalDecls.size()
-                   << " global declarations.\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Retrieved " << GlobalDecls.size()
+                 << " global declarations.\n");
     } else {
-      llvm::errs() << "[FrontendAction] ERROR: ConsumerPtr is null!\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] ERROR: ConsumerPtr is null!\n");
       return;
     }
 
     std::string GlobalText;
     for (const auto &decl : GlobalDecls) {
       GlobalText += decl;
-      llvm::errs() << "[FrontendAction] Global declaration: " << decl;
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Global declaration: " << decl);
     }
 
-    // Compute the insertion SourceLocation.
     SourceLocation FileStart = SM.getLocForStartOfFile(MainFID);
     SourceLocation insertionLoc = FileStart.getLocWithOffset(insertionOffset);
-    llvm::errs() << "[FrontendAction] Insertion location computed at offset "
-                 << insertionOffset << ": " << insertionLoc.printToString(SM)
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[FrontendAction] Insertion location computed at offset "
+               << insertionOffset << ": " << insertionLoc.printToString(SM)
+               << "\n");
 
-    // Create a Replacement to insert the global declarations after the
-    // includes.
     Replacement GlobalInsert(SM, insertionLoc, 0, GlobalText);
     if (llvm::Error Err = Reps.add(GlobalInsert))
-      llvm::errs() << "[FrontendAction] Error adding global decl replacement: "
-                   << llvm::toString(std::move(Err)) << "\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Error adding global decl replacement: "
+                 << llvm::toString(std::move(Err)) << "\n");
     else
-      llvm::errs() << "[FrontendAction] Global decl replacement added.\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Global decl replacement added.\n");
 
-    // Log all recorded replacements.
-    llvm::errs() << "[FrontendAction] Total replacements: " << Reps.size()
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs() << "[FrontendAction] Total replacements: "
+                            << Reps.size() << "\n");
     for (const auto &R : Reps) {
-      llvm::errs() << "[FrontendAction] Replacement: offset=" << R.getOffset()
-                   << ", length=" << R.getLength() << " => '"
-                   << R.getReplacementText() << "'\n";
+      LLVM_DEBUG(llvm::dbgs() << "[FrontendAction] Replacement: offset="
+                              << R.getOffset() << ", length=" << R.getLength()
+                              << " => '" << R.getReplacementText() << "'\n");
     }
 
-    // Apply all replacements.
     llvm::Expected<std::string> ChangedText =
         applyAllReplacements(OriginalText, Reps);
     if (!ChangedText) {
-      llvm::errs() << "[FrontendAction] Error applying replacements: "
-                   << llvm::toString(ChangedText.takeError()) << "\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Error applying replacements: "
+                 << llvm::toString(ChangedText.takeError()) << "\n");
       return;
     }
-    llvm::errs() << "[FrontendAction] Replacements applied successfully. Final "
-                    "text length: "
-                 << ChangedText->size() << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[FrontendAction] Replacements applied successfully. Final "
+                  "text length: "
+               << ChangedText->size() << "\n");
 
-    // Write output.
     if (OutputFilename.empty()) {
       llvm::outs() << *ChangedText;
-      llvm::errs() << "[FrontendAction] Final output written to stdout.\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Final output written to stdout.\n");
     } else {
       std::error_code EC;
       llvm::raw_fd_ostream outFile(OutputFilename, EC, llvm::sys::fs::OF_None);
       if (EC) {
-        llvm::errs() << "[FrontendAction] Error opening output file: "
-                     << EC.message() << "\n";
+        LLVM_DEBUG(llvm::dbgs()
+                   << "[FrontendAction] Error opening output file: "
+                   << EC.message() << "\n");
         return;
       }
       outFile << *ChangedText;
-      llvm::errs() << "[FrontendAction] Final output written to file: "
-                   << OutputFilename << "\n";
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[FrontendAction] Final output written to file: "
+                 << OutputFilename << "\n");
     }
   }
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
                                                  StringRef InFile) override {
-    llvm::errs() << "[FrontendAction] Creating ASTConsumer for file: " << InFile
-                 << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[FrontendAction] Creating ASTConsumer for file: " << InFile
+               << "\n");
     Reps.clear();
     auto ConsumerUniquePtr = std::make_unique<ReplacementASTConsumer>(Reps);
     ConsumerPtr = ConsumerUniquePtr.get();
@@ -314,22 +320,25 @@ class ReplacementFrontendAction : public ASTFrontendAction {
 //===----------------------------------------------------------------------===//
 
 int main(int argc, const char **argv) {
-  llvm::errs() << "[main] Starting tool with " << argc << " arguments.\n";
+  LLVM_DEBUG(llvm::dbgs() << "[main] Starting tool with " << argc
+                          << " arguments.\n");
   auto OptionsParserExpected =
       CommonOptionsParser::create(argc, argv, MyToolCategory);
   if (!OptionsParserExpected) {
-    llvm::errs() << "[main] Error creating CommonOptionsParser: "
-                 << llvm::toString(OptionsParserExpected.takeError()) << "\n";
+    LLVM_DEBUG(llvm::dbgs()
+               << "[main] Error creating CommonOptionsParser: "
+               << llvm::toString(OptionsParserExpected.takeError()) << "\n");
     return 1;
   }
   CommonOptionsParser OptionsParser = std::move(OptionsParserExpected.get());
-  llvm::errs() << "[main] Parsed options. Number of source paths: "
-               << OptionsParser.getSourcePathList().size() << "\n";
+  LLVM_DEBUG(llvm::dbgs() << "[main] Parsed options. Number of source paths: "
+                          << OptionsParser.getSourcePathList().size() << "\n");
   ClangTool Tool(OptionsParser.getCompilations(),
                  OptionsParser.getSourcePathList());
-  llvm::errs() << "[main] Running frontend action...\n";
+  LLVM_DEBUG(llvm::dbgs() << "[main] Running frontend action...\n");
   int Result =
       Tool.run(newFrontendActionFactory<ReplacementFrontendAction>().get());
-  llvm::errs() << "[main] Tool run completed with result: " << Result << "\n";
+  LLVM_DEBUG(llvm::dbgs() << "[main] Tool run completed with result: " << Result
+                          << "\n");
   return Result;
 }
