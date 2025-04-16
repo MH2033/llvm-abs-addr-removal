@@ -21,7 +21,7 @@ include_directories(${CLANG_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
 # Set the source file.
-set(SOURCES ReplaceAbsoluteAddress.cpp)
+set(SOURCES ./src/ReplaceAbsoluteAddress.cpp)
 
 # Create the executable.
 add_executable(replace-absaddr ${SOURCES})
